@@ -1,0 +1,1724 @@
+honk: dynamic ECH sources and XHTTP download-peer ECH
+
+Combined patch for the OpenWrt honk package, based on
+Glassyiris/honk feat/native-api @ 8b6778ce. Two features:
+
+1. Share links may carry a dynamic ECH source in the ech= parameter,
+   ech=<qname>+<doh-url> (the + may arrive as %2B or as a literal '+',
+   which form-decodes to a space; a bare ech=<qname> uses the
+   bootstrap resolver). The ECHConfigList is fetched via DoH (H2 POST,
+   application/dns-message, HTTPS RR) when a connection is made,
+   cached per source with TTL, and stays fail-open like ech=1. Static
+   ech_config / ech_config_path take priority. A DoH fetch that
+   receives ECH_REJECTED retry configs publishes them into the same
+   cache for the next dial.
+
+2. XHTTP downloadSettings accepts tlsSettings.echConfigList for the
+   download peer: a base64 value is a static ECHConfigList, a
+   <qname>[+<doh-url>] value is a dynamic source. The download peer
+   no longer dials with a plaintext SNI when so configured; upload
+   ECH is still never inherited.
+
+Source commits (Glassyiris/honk feat/native-api branch
+feat/ech-doh-source):
+  e55d2a9b feat(config): store ech=<qname>+<doh-url> share-link source on TlsOptions
+  21147490 feat(outbound): fetch ECHConfigList via DoH at connect time
+  4c10c445 docs: document ech=<qname>+<doh-url> share-link form
+  70dc7cc9 feat(config): accept echConfigList in XHTTP downloadSettings
+  cfb61ddc docs: document echConfigList for XHTTP download peers
+
+Apply with: patch -p1 < 0001-ech-doh-source.patch
+(PKG_SOURCE_VERSION must be 8b6778ce for this patch to apply cleanly.)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 7780dd00..62deabc5 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1717,6 +1717,7 @@ dependencies = [
+  "tokio-tungstenite 0.30.0",
+  "tracing",
+  "tracing-subscriber",
++ "url",
+  "uuid",
+  "webpki-root-certs",
+ ]
+diff --git a/crates/honk-config/src/config.rs b/crates/honk-config/src/config.rs
+index 3db44434..9eb85fba 100644
+--- a/crates/honk-config/src/config.rs
++++ b/crates/honk-config/src/config.rs
+@@ -1340,6 +1340,7 @@ fn node_schema_field(field: &str) -> Option<&'static str> {
+         "ech_enabled" => "ech_enabled",
+         "ech_config" => "ech_config",
+         "ech_config_path" => "ech_config_path",
++        "ech_doh" => "ech_doh",
+         "reality_public_key" => "reality_public_key",
+         "reality_short_id" => "reality_short_id",
+         "reality_spider_x" => "reality_spider_x",
+diff --git a/crates/honk-config/src/node.rs b/crates/honk-config/src/node.rs
+index 163599f7..2d4b810c 100644
+--- a/crates/honk-config/src/node.rs
++++ b/crates/honk-config/src/node.rs
+@@ -117,6 +117,13 @@ impl Node {
+         {
+             transport.normalize()?;
+         }
++        // A dynamic ECH source implies ECH: structured nodes may set
++        // `ech_doh` without `ech_enabled`.
++        if let Some(tls) = self.tls_mut()
++            && tls.ech_doh.is_some()
++        {
++            tls.ech_enabled = true;
++        }
+         if self.is_xhttp() {
+             let tls = self.tls_mut().expect("stream transports have TLS options");
+             XhttpOptions::normalize_alpn(&mut tls.alpn);
+@@ -130,7 +137,8 @@ impl Node {
+ 
+     /// The XHTTP download peer as its own dial target. Only protocol
+     /// credentials and upload-only request options carry over; TLS is rebuilt
+-    /// so upload pins, insecure verification, ECH and REALITY never apply.
++    /// so upload pins, insecure verification and REALITY never apply, and
++    /// ECH comes only from the download's own `echConfigList`.
+     pub fn xhttp_download_view(&self) -> Option<Node> {
+         let download = self
+             .transport()?
+@@ -153,6 +161,11 @@ impl Node {
+             enabled: true,
+             sni: download.server_name,
+             alpn: vec!["h2".into()],
++            // The download peer's own ECH, from its `echConfigList`;
++            // the upload side's ECH is never inherited.
++            ech_enabled: download.ech_config.is_some() || download.ech_doh.is_some(),
++            ech_config: download.ech_config.clone(),
++            ech_doh: download.ech_doh.clone(),
+             ..TlsOptions::default()
+         };
+         Some(view)
+diff --git a/crates/honk-config/src/node/protocol.rs b/crates/honk-config/src/node/protocol.rs
+index 5a243034..34eb400d 100644
+--- a/crates/honk-config/src/node/protocol.rs
++++ b/crates/honk-config/src/node/protocol.rs
+@@ -3,6 +3,77 @@ use crate::types::NodeProtocol;
+ 
+ use super::{VlessConfig, identity_field};
+ 
++/// Parsed `ech=<qname>[+<doh-url>]` share-link value.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct EchDohParts {
++    /// Lowercased owner name, without a trailing dot.
++    pub qname: String,
++    /// DoH endpoint URL, or `None` for a bare qname (resolved through the
++    /// bootstrap DNS path instead of DoH).
++    pub url: Option<String>,
++}
++
++impl TlsOptions {
++    /// Strict parse of the share-link `ech` value `<qname>[+<doh-url>]`.
++    /// The separator may be `+` (percent-encoded `%2B`) or a space (a
++    /// literal `+` decodes to a space in query strings). A bare `<qname>`
++    /// yields `url: None`. Fails closed on anything that is not a domain
++    /// name plus an `https://` URL.
++    pub fn parse_ech_doh(raw: &str) -> Result<EchDohParts, &'static str> {
++        let raw = raw.trim();
++        let (qname, url) = match raw.find(['+', ' ']) {
++            Some(sep) => {
++                let (qname, rest) = raw.split_at(sep);
++                (qname.trim(), Some(rest[1..].trim()))
++            }
++            None => (raw, None),
++        };
++        let qname = qname.trim_end_matches('.');
++        if qname.is_empty() || qname.len() > 253 {
++            return Err("ECH source has an empty or overlong qname");
++        }
++        // A bare qname must be dotted: without a `+<url>` part, `ech=1`
++        // and `ech=true` are the boolean discovery spellings, not names.
++        if url.is_none() && !qname.contains('.') {
++            return Err("ECH qname must be a dotted domain name");
++        }
++        if qname.parse::<std::net::IpAddr>().is_ok() {
++            return Err("ECH qname must be a domain name, not an IP literal");
++        }
++        for label in qname.split('.') {
++            if label.is_empty() || label.len() > 63 {
++                return Err("ECH qname has a bad label");
++            }
++            if !label
++                .bytes()
++                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
++            {
++                return Err("ECH qname has a bad label");
++            }
++        }
++        let url = match url {
++            Some(url) => {
++                if url.is_empty() {
++                    return Err("ECH source has an empty DoH URL");
++                }
++                let parsed = url::Url::parse(url).map_err(|_| "ECH DoH URL is invalid")?;
++                if parsed.scheme() != "https" {
++                    return Err("ECH DoH URL must use https");
++                }
++                if parsed.host_str().is_none_or(str::is_empty) {
++                    return Err("ECH DoH URL has no host");
++                }
++                Some(url.to_string())
++            }
++            None => None,
++        };
++        Ok(EchDohParts {
++            qname: qname.to_ascii_lowercase(),
++            url,
++        })
++    }
++}
++
+ #[derive(Debug, Clone, PartialEq, Default)]
+ pub struct TlsOptions {
+     pub enabled: bool,
+@@ -11,6 +82,10 @@ pub struct TlsOptions {
+     pub ech_enabled: bool,
+     pub ech_config: Option<String>,
+     pub ech_config_path: Option<String>,
++    /// Raw `<qname>[+<https-url>]` DoH source from the share-link `ech`
++    /// parameter (e.g. `cloudflare-ech.com+https://223.5.5.5/dns-query`).
++    /// Parsed and validated by honk-outbound; implies `ech_enabled`.
++    pub ech_doh: Option<String>,
+     pub reality_public_key: Option<String>,
+     pub reality_short_id: Option<String>,
+     pub reality_spider_x: Option<String>,
+diff --git a/crates/honk-config/src/node/wire.rs b/crates/honk-config/src/node/wire.rs
+index cfa40ec6..54539965 100644
+--- a/crates/honk-config/src/node/wire.rs
++++ b/crates/honk-config/src/node/wire.rs
+@@ -115,6 +115,8 @@ struct FlatNode {
+     #[serde(default)]
+     ech_config_path: Option<String>,
+     #[serde(default)]
++    ech_doh: Option<String>,
++    #[serde(default)]
+     reality_public_key: Option<String>,
+     #[serde(default)]
+     reality_short_id: Option<String>,
+@@ -365,6 +367,7 @@ impl FlatNode {
+         strip!(self.ech_enabled && !tls, ech_enabled);
+         strip!(self.ech_config.is_some() && !tls, ech_config);
+         strip!(self.ech_config_path.is_some() && !tls, ech_config_path);
++        strip!(self.ech_doh.is_some() && !tls, ech_doh);
+         strip!(
+             self.reality_public_key.is_some() && !reality,
+             reality_public_key
+@@ -482,6 +485,7 @@ impl FlatNode {
+             ech_enabled: self.ech_enabled,
+             ech_config: self.ech_config.take(),
+             ech_config_path: self.ech_config_path.take(),
++            ech_doh: self.ech_doh.take(),
+             reality_public_key: self.reality_public_key.take(),
+             reality_short_id: self.reality_short_id.take(),
+             reality_spider_x: self.reality_spider_x.take(),
+@@ -738,6 +742,7 @@ struct WireOptions<'a> {
+     ech_enabled: bool,
+     ech_config: Option<&'a str>,
+     ech_config_path: Option<&'a str>,
++    ech_doh: Option<&'a str>,
+     reality_public_key: Option<&'a str>,
+     reality_short_id: Option<&'a str>,
+     reality_spider_x: Option<&'a str>,
+@@ -786,6 +791,7 @@ impl<'a> WireOptions<'a> {
+         self.ech_enabled = tls.ech_enabled;
+         self.ech_config = tls.ech_config.as_deref();
+         self.ech_config_path = tls.ech_config_path.as_deref();
++        self.ech_doh = tls.ech_doh.as_deref();
+         self.reality_public_key = tls.reality_public_key.as_deref();
+         self.reality_short_id = tls.reality_short_id.as_deref();
+         self.reality_spider_x = tls.reality_spider_x.as_deref();
+diff --git a/crates/honk-config/src/node/xhttp.rs b/crates/honk-config/src/node/xhttp.rs
+index 714b1595..c8bbc384 100644
+--- a/crates/honk-config/src/node/xhttp.rs
++++ b/crates/honk-config/src/node/xhttp.rs
+@@ -161,6 +161,16 @@ pub struct XhttpDownload {
+     pub path: String,
+     #[serde(default = "default_padding", deserialize_with = "padding_range")]
+     pub x_padding_bytes: XhttpRange,
++    /// Static base64 ECHConfigList for the download peer, from
++    /// `downloadSettings.tlsSettings.echConfigList`. Absent options
++    /// serialize nothing, keeping existing XHTTP node IDs.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub ech_config: Option<String>,
++    /// Dynamic ECH source for the download peer (`<qname>[+<doh-url>]`,
++    /// the non-base64 `echConfigList` form); resolved like a node's own
++    /// `ech=` source at dial time.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub ech_doh: Option<String>,
+ }
+ 
+ fn default_path() -> String {
+@@ -178,6 +188,23 @@ impl XhttpDownload {
+         self.server_name = self.server_name.take().filter(|name| !name.is_empty());
+     }
+ 
++    /// Canonical nodes may set the download ECH fields directly; each
++    /// present field must be well-formed, as classification guarantees
++    /// for the share-link and subscription paths.
++    fn validate_ech(&self) -> Result<(), &'static str> {
++        if let Some(raw) = &self.ech_doh
++            && TlsOptions::parse_ech_doh(raw).is_err()
++        {
++            return Err("XHTTP download ECH source must be <qname>[+<doh-url>]");
++        }
++        if let Some(raw) = &self.ech_config
++            && decode_ech_config_list(raw).is_none()
++        {
++            return Err("XHTTP download ECH config must be a base64 ECHConfigList");
++        }
++        Ok(())
++    }
++
+     /// The dialer joins `address:port` textually, so only names and IPv4 literals can be dialed;
+     /// anything else would be admitted here and fail on every flow.
+     fn validate_address(&self) -> Result<(), &'static str> {
+@@ -406,6 +433,8 @@ pub struct XrayDownload {
+ struct XrayDownloadTls {
+     #[serde(rename = "serverName")]
+     server_name: Option<String>,
++    #[serde(rename = "echConfigList")]
++    ech_config_list: Option<String>,
+     // Global TLS mode owns the fingerprint, as for the upload `fp`.
+     #[serde(rename = "fingerprint")]
+     _fingerprint: Option<String>,
+@@ -424,6 +453,48 @@ struct XrayDownloadXhttp {
+     _mode: Option<XhttpMode>,
+ }
+ 
++/// Decode a base64 ECHConfigList with the outbound decoder's acceptance:
++/// standard or URL-safe alphabet, padded or unpadded, whitespace ignored.
++/// `None` for anything else, including the empty string.
++fn decode_ech_config_list(encoded: &str) -> Option<Vec<u8>> {
++    use base64::Engine as _;
++    let cleaned: String = encoded.chars().filter(|c| !c.is_whitespace()).collect();
++    for engine in [
++        &base64::engine::general_purpose::STANDARD,
++        &base64::engine::general_purpose::URL_SAFE,
++    ] {
++        if let Ok(bytes) = engine.decode(&cleaned) {
++            return (!bytes.is_empty()).then_some(bytes);
++        }
++    }
++    let trimmed = cleaned.trim_end_matches('=');
++    for engine in [
++        &base64::engine::general_purpose::STANDARD_NO_PAD,
++        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
++    ] {
++        if let Ok(bytes) = engine.decode(trimmed) {
++            return (!bytes.is_empty()).then_some(bytes);
++        }
++    }
++    None
++}
++
++/// Classify an Xray `echConfigList` value into the download peer's
++/// `(ech_config, ech_doh)`: a dynamic `<qname>[+<doh-url>]` source, or a
++/// static base64 ECHConfigList. The grammars are disjoint — dynamic
++/// values always contain `.` or `:`, neither of which exists in either
++/// base64 alphabet — so trying dynamic first cannot steal a static value.
++fn classify_download_ech(raw: &str) -> Result<(Option<String>, Option<String>), &'static str> {
++    let raw = raw.trim();
++    if TlsOptions::parse_ech_doh(raw).is_ok() {
++        return Ok((None, Some(raw.to_string())));
++    }
++    if decode_ech_config_list(raw).is_some() {
++        return Ok((Some(raw.to_string()), None));
++    }
++    Err("unsupported XHTTP download settings")
++}
++
+ impl XrayDownload {
+     pub fn into_download(self) -> Result<XhttpDownload, &'static str> {
+         let tls = self.tls_settings.unwrap_or_default();
+@@ -442,6 +513,10 @@ impl XrayDownload {
+         {
+             return Err("unsupported XHTTP download settings");
+         }
++        let (ech_config, ech_doh) = match tls.ech_config_list.as_deref() {
++            Some(raw) => classify_download_ech(raw)?,
++            None => (None, None),
++        };
+         Ok(XhttpDownload {
+             address: self.address,
+             port: self.port,
+@@ -449,6 +524,8 @@ impl XrayDownload {
+             host: xhttp.host,
+             path: xhttp.path.unwrap_or_else(default_path),
+             x_padding_bytes: XhttpOptions::DEFAULT_PADDING,
++            ech_config,
++            ech_doh,
+         })
+     }
+ }
+@@ -655,6 +732,7 @@ impl XhttpOptions {
+                 return Err("XHTTP download settings cannot use stream-one mode");
+             }
+             download.validate_address()?;
++            download.validate_ech()?;
+         }
+         Ok(())
+     }
+diff --git a/crates/honk-config/src/share_link/options.rs b/crates/honk-config/src/share_link/options.rs
+index 1e048f53..59ca7661 100644
+--- a/crates/honk-config/src/share_link/options.rs
++++ b/crates/honk-config/src/share_link/options.rs
+@@ -3,8 +3,8 @@
+ use crate::diagnostic::{SettingPath, SourceRef};
+ use crate::error::{ConfigError, DetailedConfigError, ErrorCategory};
+ use crate::node::{
+-    Hysteria2Config, Node, OutboundConfig, QuicOptions, Udp443Policy, VlessConfig, VlessMultiplex,
+-    VlessUdpEncoding,
++    Hysteria2Config, Node, OutboundConfig, QuicOptions, TlsOptions, Udp443Policy, VlessConfig,
++    VlessMultiplex, VlessUdpEncoding,
+ };
+ use crate::options::vocab::{
+     coalesce_equal, optional_flow, optional_text, verification_text, vmess_cipher,
+@@ -146,6 +146,19 @@ pub(super) fn parse_query(
+     Ok(query)
+ }
+ 
++/// Recognize a dynamic ECH source in the share-link `ech` parameter:
++/// `<qname>[+<https-url>]` (e.g. `cloudflare-ech.com+https://223.5.5.5/dns-query`),
++/// or a bare `<qname>` (resolved through the bootstrap DNS path).
++/// The separator may arrive as `+` (percent-encoded `%2B`) or as a space
++/// (a literal `+` decodes to a space in query strings). Returns the trimmed
++/// raw value for `ech_doh`.
++fn ech_doh_source(value: &str) -> Option<String> {
++    let value = value.trim();
++    TlsOptions::parse_ech_doh(value)
++        .ok()
++        .map(|_| value.to_string())
++}
++
+ pub(super) fn apply_tls(
+     node: &mut Node,
+     query: &Query,
+@@ -288,7 +301,12 @@ pub(super) fn apply_tls(
+             tls.ech_enabled = true;
+             tls.ech_config = Some(value.clone());
+         } else if let Some(value) = query.get("ech") {
+-            tls.ech_enabled = value == "1" || value.eq_ignore_ascii_case("true");
++            if let Some(raw) = ech_doh_source(value) {
++                tls.ech_enabled = true;
++                tls.ech_doh = Some(raw);
++            } else {
++                tls.ech_enabled = value == "1" || value.eq_ignore_ascii_case("true");
++            }
+         }
+         if reality {
+             tls.enabled = true;
+diff --git a/crates/honk-config/tests/fixtures/node_flat.json b/crates/honk-config/tests/fixtures/node_flat.json
+index 6a8a58cd..f83ddd1c 100644
+--- a/crates/honk-config/tests/fixtures/node_flat.json
++++ b/crates/honk-config/tests/fixtures/node_flat.json
+@@ -21,6 +21,7 @@
+   "ech_enabled": true,
+   "ech_config": "AAECAw==",
+   "ech_config_path": null,
++  "ech_doh": null,
+   "reality_public_key": "reality-public-key",
+   "reality_short_id": "0123456789abcdef",
+   "reality_spider_x": "/spider",
+diff --git a/crates/honk-config/tests/fixtures/node_flat.yaml b/crates/honk-config/tests/fixtures/node_flat.yaml
+index a1302daf..9f04eb0c 100644
+--- a/crates/honk-config/tests/fixtures/node_flat.yaml
++++ b/crates/honk-config/tests/fixtures/node_flat.yaml
+@@ -19,6 +19,7 @@ skip_cert_verify: true
+ ech_enabled: true
+ ech_config: AAECAw==
+ ech_config_path: null
++ech_doh: null
+ reality_public_key: reality-public-key
+ reality_short_id: 0123456789abcdef
+ reality_spider_x: /spider
+diff --git a/crates/honk-config/tests/share_link.rs b/crates/honk-config/tests/share_link.rs
+index 827d054c..21af8bcd 100644
+--- a/crates/honk-config/tests/share_link.rs
++++ b/crates/honk-config/tests/share_link.rs
+@@ -1170,6 +1170,55 @@ fn test_ech_query_params() {
+     .unwrap();
+     assert!(node.tls().unwrap().ech_enabled);
+     assert!(node.tls().unwrap().ech_config.is_none());
++
++    // ech=<qname>+<doh-url> selects dynamic DoH fetch and enables ECH.
++    let node = Node::from_share_link(
++        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=&ech=cloudflare-ech.com%2Bhttps%3A%2F%2F223.5.5.5%2Fdns-query",
++    )
++    .unwrap();
++    let tls = node.tls().unwrap();
++    assert!(tls.ech_enabled);
++    assert_eq!(
++        tls.ech_doh.as_deref(),
++        Some("cloudflare-ech.com+https://223.5.5.5/dns-query")
++    );
++    assert!(tls.ech_config.is_none());
++
++    // A literal '+' in the query string decodes to a space; that spelling
++    // selects the DoH source too.
++    let node = Node::from_share_link(
++        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=&ech=cloudflare-ech.com+https://223.5.5.5/dns-query",
++    )
++    .unwrap();
++    assert_eq!(
++        node.tls().unwrap().ech_doh.as_deref(),
++        Some("cloudflare-ech.com https://223.5.5.5/dns-query")
++    );
++
++    // Non-URL ech values keep the old boolean meaning.
++    let node = Node::from_share_link(
++        "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443/?ech=yes",
++    )
++    .unwrap();
++    assert!(!node.tls().unwrap().ech_enabled);
++    assert!(node.tls().unwrap().ech_doh.is_none());
++
++    // A bare ech=<qname> selects dynamic fetch through the bootstrap DNS path.
++    let node = Node::from_share_link(
++        "vless://b831381d-6324-4d53-ad4f-8cda48b30811@example.com:443?security=tls&flow=&ech=cloudflare-ech.com",
++    )
++    .unwrap();
++    let tls = node.tls().unwrap();
++    assert!(tls.ech_enabled);
++    assert_eq!(tls.ech_doh.as_deref(), Some("cloudflare-ech.com"));
++
++    // A bare IP is not a qname: ignored like any other non-boolean value.
++    let node = Node::from_share_link(
++        "tuic://b831381d-6324-4d53-ad4f-8cda48b30811:p@example.com:443/?ech=192.0.2.1",
++    )
++    .unwrap();
++    assert!(!node.tls().unwrap().ech_enabled);
++    assert!(node.tls().unwrap().ech_doh.is_none());
+ }
+ 
+ #[test]
+diff --git a/crates/honk-config/tests/xhttp.rs b/crates/honk-config/tests/xhttp.rs
+index 0e958dff..1df3ce06 100644
+--- a/crates/honk-config/tests/xhttp.rs
++++ b/crates/honk-config/tests/xhttp.rs
+@@ -759,6 +759,81 @@ fn download_settings_map_to_an_uninherited_download_peer() {
+     );
+ }
+ 
++#[test]
++fn download_settings_ech_config_list_static_and_dynamic() {
++    let with_ech = |value: &str| {
++        let mut settings = download_settings();
++        settings["tlsSettings"]["echConfigList"] = json!(value);
++        download_link(json!({"downloadSettings": settings}), "").unwrap()
++    };
++
++    // Static: a base64 ECHConfigList lands on the download settings and
++    // on the download peer's rebuilt TLS.
++    let node = with_ech("AAECAw==");
++    let download = node
++        .transport()
++        .unwrap()
++        .xhttp
++        .as_ref()
++        .unwrap()
++        .download
++        .as_deref()
++        .unwrap();
++    assert_eq!(download.ech_config.as_deref(), Some("AAECAw=="));
++    assert!(download.ech_doh.is_none());
++    let view = node.xhttp_download_view().unwrap();
++    let tls = view.tls().unwrap();
++    assert!(tls.ech_enabled);
++    assert_eq!(tls.ech_config.as_deref(), Some("AAECAw=="));
++    assert!(tls.ech_doh.is_none());
++    // The upload side is untouched: download ECH is never inherited
++    // in either direction.
++    assert!(node.tls().unwrap().ech_config.is_none());
++
++    // Dynamic: <qname>+<doh-url> selects the DoH source.
++    let node = with_ech("cloudflare-ech.com+https://223.5.5.5/dns-query");
++    let download = node
++        .transport()
++        .unwrap()
++        .xhttp
++        .as_ref()
++        .unwrap()
++        .download
++        .as_deref()
++        .unwrap();
++    assert_eq!(
++        download.ech_doh.as_deref(),
++        Some("cloudflare-ech.com+https://223.5.5.5/dns-query")
++    );
++    assert!(download.ech_config.is_none());
++    let view = node.xhttp_download_view().unwrap();
++    let tls = view.tls().unwrap();
++    assert!(tls.ech_enabled);
++    assert_eq!(
++        tls.ech_doh.as_deref(),
++        Some("cloudflare-ech.com+https://223.5.5.5/dns-query")
++    );
++
++    // A bare qname selects dynamic fetch through the bootstrap DNS path.
++    let node = with_ech("cloudflare-ech.com");
++    let download = node
++        .transport()
++        .unwrap()
++        .xhttp
++        .as_ref()
++        .unwrap()
++        .download
++        .as_deref()
++        .unwrap();
++    assert_eq!(download.ech_doh.as_deref(), Some("cloudflare-ech.com"));
++
++    // ECH on the download peer is part of the node's dial shape: the ID
++    // changes with it, while a download without ECH keeps the old ID
++    // (covered by download_settings_map_to_an_uninherited_download_peer).
++    let plain = download_link(json!({"downloadSettings": download_settings()}), "").unwrap();
++    assert_ne!(node.id, plain.id);
++}
++
+ #[test]
+ fn download_settings_reject_unrepresentable_peers() {
+     let base = download_settings();
+@@ -774,6 +849,11 @@ fn download_settings_reject_unrepresentable_peers() {
+         ("/tlsSettings/allowInsecure", json!(true)),
+         ("/tlsSettings/pinnedPeerCertSha256", json!("00")),
+         ("/tlsSettings/echConfigList", json!("x")),
++        ("/tlsSettings/echConfigList", json!("")),
++        (
++            "/tlsSettings/echConfigList",
++            json!("cloudflare-ech.com+http://223.5.5.5/dns-query"),
++        ),
+         ("/xhttpSettings/extra", json!({})),
+         ("/xhttpSettings/headers", json!({})),
+         ("/xhttpSettings/mode", json!("invalid")),
+diff --git a/crates/honk-outbound/Cargo.toml b/crates/honk-outbound/Cargo.toml
+index 9d081b11..21a1f83a 100644
+--- a/crates/honk-outbound/Cargo.toml
++++ b/crates/honk-outbound/Cargo.toml
+@@ -49,6 +49,7 @@ quinn-proto.workspace = true
+ # HTTP/2 client for the urltest latency probe (urltest.rs)
+ h2.workspace = true
+ http.workspace = true
++url.workspace = true
+ 
+ [dev-dependencies]
+ chrono.workspace = true
+diff --git a/crates/honk-outbound/src/bootstrap.rs b/crates/honk-outbound/src/bootstrap.rs
+index c4a4b6a6..a05c1e62 100644
+--- a/crates/honk-outbound/src/bootstrap.rs
++++ b/crates/honk-outbound/src/bootstrap.rs
+@@ -244,7 +244,7 @@ impl BootstrapResolver {
+ /// Whether `resp` answers `query` (as built by [`build_query`]): same ID, QR
+ /// set, same opcode and exactly the sent question. Names are case-insensitive
+ /// in DNS, so only the name ignores ASCII case; type and class must match exactly.
+-fn answers_query(query: &[u8], resp: &[u8]) -> bool {
++pub(crate) fn answers_query(query: &[u8], resp: &[u8]) -> bool {
+     let (name, type_class) = query[12..].split_at(query.len() - 16);
+     resp.len() >= 12
+         && resp[..2] == query[..2]
+@@ -273,7 +273,7 @@ fn system_nameserver() -> Option<SocketAddr> {
+ }
+ 
+ /// DNS qtype for HTTPS service-binding records (RFC 9460).
+-const QTYPE_HTTPS: u16 = 65;
++pub(crate) const QTYPE_HTTPS: u16 = 65;
+ /// SVCB SvcParam key carrying the ECHConfigList.
+ const SVCB_KEY_ECH: u16 = 5;
+ 
+@@ -321,7 +321,7 @@ pub async fn query_ech_config(host: &str) -> io::Result<Option<(Vec<u8>, u32)>>
+ /// Extract the ECHConfigList and TTL from the first ServiceMode HTTPS RR in
+ /// a DNS response. AliasMode records (priority != 0) carry no SvcParams and
+ /// are skipped.
+-fn parse_https_rr_ech(msg: &[u8]) -> Option<(Vec<u8>, u32)> {
++pub(crate) fn parse_https_rr_ech(msg: &[u8]) -> Option<(Vec<u8>, u32)> {
+     if msg.len() < 12 {
+         return None;
+     }
+@@ -380,7 +380,7 @@ fn parse_svcb_ech_param(rdata: &[u8]) -> Option<Vec<u8>> {
+ }
+ 
+ /// Build a minimal DNS query (RD set, single question).
+-fn build_query(host: &str, qtype: u16) -> Vec<u8> {
++pub(crate) fn build_query(host: &str, qtype: u16) -> Vec<u8> {
+     let mut q = Vec::with_capacity(host.len() + 18);
+     q.extend_from_slice(&rand::random::<u16>().to_be_bytes()); // id
+     q.extend_from_slice(&0x0100u16.to_be_bytes()); // RD
+diff --git a/crates/honk-outbound/src/ech_doh.rs b/crates/honk-outbound/src/ech_doh.rs
+new file mode 100644
+index 00000000..0aae617f
+--- /dev/null
++++ b/crates/honk-outbound/src/ech_doh.rs
+@@ -0,0 +1,376 @@
++//! ECH config resolution: static, DNS discovery, or DoH.
++//!
++//! A node can carry `ech=<qname>+<doh-url>` in its share-link `ech`
++//! parameter (e.g. `ech=cloudflare-ech.com+https://223.5.5.5/dns-query`):
++//! the ECHConfigList is read from the `ech` SvcParam of `qname`'s HTTPS
++//! record, fetched with a DNS-over-HTTPS POST to the given endpoint.
++//! A bare `ech=<qname>` (no URL) resolves through the bootstrap DNS path
++//! (`EchSource::Discover`), honoring the user's own resolver instead of a
++//! hard-coded third party.
++//!
++//! Resolution is on-demand against a single TTL cache keyed by source.
++//! A cache miss fetches inline with a bounded timeout — the first TLS dial
++//! after (re)start therefore waits for the fetch instead of leaking the
++//! SNI in cleartext — and fail-open past it. QUIC resolves per-connection
++//! from the cache and triggers a background refill on a miss, so key
++//! rotation reaches long-lived runtimes without blocking the handshake.
++//! Static `ech_config`/`ech_config_path` still win over dynamic sources.
++//!
++//! Every socket here (DoH host resolution through the bootstrap resolver,
++//! the TCP dial) carries the bypass mark, so honk's own eBPF datapath never
++//! routes this host-originated traffic through a proxy — possibly the very
++//! ECH node waiting for the config.
++
++use std::collections::HashMap;
++use std::sync::{Arc, LazyLock, Mutex};
++use std::time::{Duration, Instant};
++
++use anyhow::Context as _;
++use bytes::Bytes;
++
++/// Per-stage budget inside a DoH fetch: TCP connect, TLS handshake and the
++/// H2 exchange each get this long.
++const ECH_DOH_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
++const ECH_DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
++/// Cap on a DoH response body; an ECH answer is a few hundred bytes.
++const ECH_DOH_MAX_BODY: usize = 64 * 1024;
++/// TTL clamp for positive cache entries, and negative-cache lifetime.
++const ECH_TTL_MIN: u32 = 60;
++const ECH_TTL_MAX: u32 = 86400;
++const ECH_NEGATIVE_TTL: u32 = 300;
++
++/// A parsed DoH endpoint: host, port and path, computed once.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub(crate) struct DohEndpoint {
++    /// Without IPv6 brackets; `dial_addr` re-adds them.
++    host: String,
++    port: u16,
++    /// Path plus query; a bare `/` falls back to `/dns-query`.
++    path: String,
++}
++
++impl DohEndpoint {
++    fn parse(url: &str) -> anyhow::Result<Self> {
++        let parsed = url::Url::parse(url).context("invalid DoH URL")?;
++        let bracketed = parsed.host_str().context("DoH URL has no host")?;
++        let host = bracketed
++            .strip_prefix('[')
++            .and_then(|inner| inner.strip_suffix(']'))
++            .unwrap_or(bracketed)
++            .to_string();
++        let port = parsed
++            .port_or_known_default()
++            .context("DoH URL has no port")?;
++        let mut path = parsed.path().to_string();
++        if path.is_empty() || path == "/" {
++            path = "/dns-query".to_string();
++        }
++        if let Some(query) = parsed.query() {
++            path.push('?');
++            path.push_str(query);
++        }
++        Ok(Self { host, port, path })
++    }
++
++    /// `host:port` with IPv6 brackets, always explicit: `connect_marked`
++    /// requires the port, and omitting 443 breaks its `rsplit_once(':')`
++    /// parse (or splits inside a bracketed IPv6 literal).
++    fn dial_addr(&self) -> String {
++        if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
++            format!("[{}]:{}", self.host, self.port)
++        } else {
++            format!("{}:{}", self.host, self.port)
++        }
++    }
++
++    /// Value for the `:authority` pseudo-header; the default port is omitted.
++    fn authority(&self) -> String {
++        let host = if self.host.parse::<std::net::Ipv6Addr>().is_ok() {
++            format!("[{}]", self.host)
++        } else {
++            self.host.clone()
++        };
++        if self.port == 443 {
++            host
++        } else {
++            format!("{host}:{}", self.port)
++        }
++    }
++}
++
++/// A DoH endpoint plus the HTTPS-RR owner name whose `ech` SvcParam
++/// supplies the ECHConfigList.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub(crate) struct EchDohSource {
++    /// Lowercased owner name, without a trailing dot.
++    pub qname: String,
++    /// The DoH endpoint URL as configured (`https://...`).
++    pub url: String,
++    /// Endpoint parsed once at construction.
++    pub endpoint: DohEndpoint,
++}
++
++/// A dynamic ECH source: the cache key and the fetch transport.
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub(crate) enum EchSource {
++    /// HTTPS RR via the bootstrap resolver (bare `ech=<qname>` or
++    /// `ech_enabled`); lowercased domain without a trailing dot.
++    Discover(String),
++    /// `ech=<qname>+<doh-url>`: DoH fetch from the explicit endpoint.
++    Doh(EchDohSource),
++}
++
++impl EchSource {
++    /// Discovery source for a connect-time name, normalized the way the
++    /// previous discovery cache keyed it: lowercased, trailing dot stripped.
++    pub(crate) fn discover(domain: &str) -> Self {
++        Self::Discover(domain.trim_end_matches('.').to_ascii_lowercase())
++    }
++}
++
++/// Fully resolved ECH origin for a connector, decided once at build time.
++#[derive(Clone, Debug)]
++pub(crate) enum Ech {
++    /// Static `ech_config`/`ech_config_path`.
++    Static(Arc<[u8]>),
++    /// Dynamic source; resolved against the TTL cache per dial/connection.
++    Source(EchSource),
++    /// `ech_enabled`: discover via the connect-time SNI. TLS resolves this
++    /// in `connect`; QUIC resolves it at build time from the configured
++    /// SNI or host.
++    DiscoverSni,
++}
++
++impl Ech {
++    /// Resolve a node's ECH origin once. Static config wins, then
++    /// `ech=<qname>[+<doh-url>]`, then `ech_enabled`.
++    pub(crate) fn resolve(node: &honk_config::node::Node) -> anyhow::Result<Option<Ech>> {
++        if let Some(list) = crate::tls::load_ech_config_list(node)? {
++            return Ok(Some(Ech::Static(list.into())));
++        }
++        if let Some(source) = parse_node_ech_source(node)? {
++            return Ok(Some(Ech::Source(source)));
++        }
++        let enabled = node.tls().is_some_and(|tls| tls.ech_enabled);
++        Ok(enabled.then_some(Ech::DiscoverSni))
++    }
++}
++
++/// Parse a node's `ech` value once; `None` when the node carries none.
++pub(crate) fn parse_node_ech_source(
++    node: &honk_config::node::Node,
++) -> anyhow::Result<Option<EchSource>> {
++    node.tls()
++        .and_then(|tls| tls.ech_doh.as_deref())
++        .map(parse_ech_source)
++        .transpose()
++        .with_context(|| format!("node '{}': invalid ech source", node.name))
++}
++
++/// Parse a share-link `ech` value into its fetch source. Validation is the
++/// strict honk-config parser, so config-time and outbound agree.
++pub(crate) fn parse_ech_source(raw: &str) -> anyhow::Result<EchSource> {
++    let parts = honk_config::node::TlsOptions::parse_ech_doh(raw)
++        .map_err(|message| anyhow::anyhow!("invalid ech source {raw:?}: {message}"))?;
++    match parts.url {
++        Some(url) => Ok(EchSource::Doh(EchDohSource {
++            qname: parts.qname,
++            endpoint: DohEndpoint::parse(&url)?,
++            url,
++        })),
++        None => Ok(EchSource::Discover(parts.qname)),
++    }
++}
++
++struct EchCacheEntry {
++    config: Option<Arc<[u8]>>,
++    expires: Instant,
++}
++
++static ECH_CACHE: LazyLock<Mutex<HashMap<EchSource, EchCacheEntry>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++fn cache_get(source: &EchSource) -> Option<Option<Arc<[u8]>>> {
++    ECH_CACHE
++        .lock()
++        .unwrap()
++        .get(source)
++        .filter(|hit| hit.expires > Instant::now())
++        .map(|hit| hit.config.clone())
++}
++
++fn cache_put(source: &EchSource, config: Option<Arc<[u8]>>, ttl: u32) {
++    ECH_CACHE.lock().unwrap().insert(
++        source.clone(),
++        EchCacheEntry {
++            config,
++            expires: Instant::now() + Duration::from_secs(ttl as u64),
++        },
++    );
++}
++
++/// Fetch `(ECHConfigList, ttl)` for a source. `None` when the lookup
++/// yields no ECH record; failures are `Err`.
++type EchFetchFuture<'a> = std::pin::Pin<
++    Box<dyn std::future::Future<Output = anyhow::Result<Option<(Vec<u8>, u32)>>> + Send + 'a>,
++>;
++
++fn fetch_source(source: &EchSource) -> EchFetchFuture<'_> {
++    Box::pin(async move {
++        match source {
++            EchSource::Discover(domain) => {
++                if domain.is_empty() || domain.parse::<std::net::IpAddr>().is_ok() {
++                    return Ok(None);
++                }
++                let query = tokio::time::timeout(
++                    ECH_DISCOVER_TIMEOUT,
++                    crate::bootstrap::query_ech_config(domain),
++                )
++                .await
++                .context("ECH discovery timed out")?;
++                Ok(query?)
++            }
++            EchSource::Doh(doh) => Ok(Some(fetch_ech_via_doh(doh).await?)),
++        }
++    })
++}
++
++/// Resolve a source's ECHConfigList: cache hit, or a bounded inline fetch
++/// on miss/expiry (fail-open). TLS dials call this; the first dial after
++/// (re)start waits for the fetch instead of leaking the SNI.
++pub(crate) async fn ech_config(source: &EchSource) -> Option<Arc<[u8]>> {
++    if let Some(hit) = cache_get(source) {
++        return hit;
++    }
++    match fetch_source(source).await {
++        Ok(Some((config, ttl))) => {
++            let config: Arc<[u8]> = config.into();
++            tracing::debug!("resolved ECH config");
++            cache_put(
++                source,
++                Some(config.clone()),
++                ttl.clamp(ECH_TTL_MIN, ECH_TTL_MAX),
++            );
++            Some(config)
++        }
++        Ok(None) => {
++            cache_put(source, None, ECH_NEGATIVE_TTL);
++            None
++        }
++        Err(error) => {
++            tracing::debug!(%error, "ECH fetch failed; proceeding without ECH");
++            // Don't cache failures: the next dial retries.
++            None
++        }
++    }
++}
++
++/// Synchronous cache read for per-connection resolution (QUIC
++/// `start_session`). Returns `None` on miss/expiry; call
++/// [`spawn_ech_refresh`] to refill in the background.
++pub(crate) fn cached_ech_config(source: &EchSource) -> Option<Arc<[u8]>> {
++    cache_get(source).flatten()
++}
++
++/// Publish server-offered ECH retry configs (e.g. after `ECH_REJECTED`),
++/// replacing the cached entry so the next dial uses them immediately.
++pub(crate) fn publish_ech_config(source: &EchSource, config: Vec<u8>) {
++    // Retry configs carry no TTL; keep them like a fresh lookup.
++    cache_put(source, Some(config.into()), 3600);
++}
++
++/// Refill a source's cache entry in the background. QUIC calls this when
++/// `start_session` finds no valid entry, so key rotation reaches
++/// long-lived runtimes without blocking the handshake.
++pub(crate) fn spawn_ech_refresh(source: EchSource) {
++    tokio::spawn(async move {
++        // `ech_config` rechecks the cache first, so concurrent triggers
++        // collapse into one fetch.
++        ech_config(&source).await;
++    });
++}
++
++/// One RFC 8484 POST over HTTP/2: returns the raw DNS response message,
++/// checked against the query (ID and question).
++async fn doh_h2_post<S>(io: S, authority: &str, path: &str, query: &[u8]) -> anyhow::Result<Vec<u8>>
++where
++    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
++{
++    let (mut sender, conn) = h2::client::handshake(io)
++        .await
++        .context("DoH HTTP/2 handshake")?;
++    tokio::spawn(async move {
++        let _ = conn.await;
++    });
++    let request = http::Request::builder()
++        .method(http::Method::POST)
++        .uri(format!("https://{authority}{path}"))
++        .header("content-type", "application/dns-message")
++        .header("accept", "application/dns-message")
++        .header("content-length", query.len().to_string())
++        .body(())
++        .context("DoH request build")?;
++    let (response_fut, mut send_stream) = sender
++        .send_request(request, false)
++        .context("DoH send_request")?;
++    send_stream
++        .send_data(Bytes::copy_from_slice(query), true)
++        .context("DoH send_data")?;
++    let response = response_fut.await.context("DoH response")?;
++    let status = response.status();
++    if !status.is_success() {
++        anyhow::bail!("DoH HTTP status {status}");
++    }
++    let mut body = response.into_body();
++    let mut buf = Vec::new();
++    while let Some(chunk) = body.data().await {
++        let chunk = chunk.context("DoH body read")?;
++        if buf.len() + chunk.len() > ECH_DOH_MAX_BODY {
++            anyhow::bail!("DoH response too large");
++        }
++        buf.extend_from_slice(&chunk);
++        let _ = body.flow_control().release_capacity(chunk.len());
++    }
++    if !crate::bootstrap::answers_query(query, &buf) {
++        anyhow::bail!("DoH response does not match the query");
++    }
++    Ok(buf)
++}
++
++/// Fetch `(ECHConfigList, ttl)` for the source's qname via its DoH endpoint.
++/// The dial carries the bypass mark: this is host-originated traffic that
++/// must never be routed through a proxy by honk's own eBPF datapath.
++async fn fetch_ech_via_doh(source: &EchDohSource) -> anyhow::Result<(Vec<u8>, u32)> {
++    let endpoint = &source.endpoint;
++    // `connect_outbound` resolves, races and bypass-marks; the dial address
++    // always carries an explicit port.
++    let dial_addr = endpoint.dial_addr();
++    let tcp = crate::util::connect_outbound(&dial_addr, ECH_DOH_FETCH_TIMEOUT)
++        .await
++        .with_context(|| format!("DoH TCP connect to {dial_addr}"))?;
++    let connector =
++        crate::tls::build_dns_connector(false, b"\x02h2").context("DoH TLS connector")?;
++    let tls = tokio::time::timeout(
++        ECH_DOH_FETCH_TIMEOUT,
++        connector.connect(&endpoint.host, tcp),
++    )
++    .await
++    .context("DoH TLS handshake timed out")?
++    .with_context(|| format!("DoH TLS handshake with {}", endpoint.host))?;
++    if tls.ssl().selected_alpn_protocol() != Some(b"h2".as_slice()) {
++        anyhow::bail!("DoH endpoint {} did not negotiate h2", endpoint.host);
++    }
++    let query = crate::bootstrap::build_query(&source.qname, crate::bootstrap::QTYPE_HTTPS);
++    let authority = endpoint.authority();
++    let body = tokio::time::timeout(
++        ECH_DOH_FETCH_TIMEOUT,
++        doh_h2_post(tls, &authority, &endpoint.path, &query),
++    )
++    .await
++    .context("DoH exchange timed out")??;
++    crate::bootstrap::parse_https_rr_ech(&body)
++        .ok_or_else(|| anyhow::anyhow!("DoH response for {} carried no ECH config", source.qname))
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/honk-outbound/src/ech_doh/tests.rs b/crates/honk-outbound/src/ech_doh/tests.rs
+new file mode 100644
+index 00000000..145dac57
+--- /dev/null
++++ b/crates/honk-outbound/src/ech_doh/tests.rs
+@@ -0,0 +1,288 @@
++use super::*;
++
++/// Real DoH response captured from `https://223.5.5.5/dns-query?dns=...`
++/// for `cloudflare-ech.com` type 65 (195 bytes).
++const DOH_RESPONSE: &[u8] = &[
++    0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x0e, 0x63, 0x6c, 0x6f,
++    0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65, 0x2d, 0x65, 0x63, 0x68, 0x03, 0x63, 0x6f, 0x6d, 0x00,
++    0x00, 0x41, 0x00, 0x01, 0xc0, 0x0c, 0x00, 0x41, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x88,
++    0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x06, 0x02, 0x68, 0x33, 0x02, 0x68, 0x32, 0x00, 0x04, 0x00,
++    0x08, 0x68, 0x12, 0x0a, 0x76, 0x68, 0x12, 0x0b, 0x76, 0x00, 0x05, 0x00, 0x47, 0x00, 0x45, 0xfe,
++    0x0d, 0x00, 0x41, 0x11, 0x00, 0x20, 0x00, 0x20, 0xef, 0x4a, 0x1c, 0x15, 0x07, 0xee, 0x51, 0x9b,
++    0xb7, 0x0e, 0xa2, 0xe7, 0x1a, 0x49, 0x76, 0xb7, 0xe0, 0xb8, 0xb0, 0x83, 0x21, 0x83, 0x11, 0xd0,
++    0x15, 0x46, 0x79, 0xe5, 0xfc, 0x82, 0xd1, 0x10, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x12,
++    0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65, 0x2d, 0x65, 0x63, 0x68, 0x2e, 0x63,
++    0x6f, 0x6d, 0x00, 0x00, 0x00, 0x06, 0x00, 0x20, 0x26, 0x06, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x68, 0x12, 0x0a, 0x76, 0x26, 0x06, 0x47, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x68, 0x12, 0x0b, 0x76, 0x00, 0x00, 0x29, 0x04, 0xd0, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00,
++];
++
++/// The `ech` SvcParam value (key 5) inside `DOH_RESPONSE`.
++const EXPECTED_ECH: &[u8] = &[
++    0x00, 0x45, 0xfe, 0x0d, 0x00, 0x41, 0x11, 0x00, 0x20, 0x00, 0x20, 0xef, 0x4a, 0x1c, 0x15, 0x07,
++    0xee, 0x51, 0x9b, 0xb7, 0x0e, 0xa2, 0xe7, 0x1a, 0x49, 0x76, 0xb7, 0xe0, 0xb8, 0xb0, 0x83, 0x21,
++    0x83, 0x11, 0xd0, 0x15, 0x46, 0x79, 0xe5, 0xfc, 0x82, 0xd1, 0x10, 0x00, 0x04, 0x00, 0x01, 0x00,
++    0x01, 0x00, 0x12, 0x63, 0x6c, 0x6f, 0x75, 0x64, 0x66, 0x6c, 0x61, 0x72, 0x65, 0x2d, 0x65, 0x63,
++    0x68, 0x2e, 0x63, 0x6f, 0x6d, 0x00, 0x00,
++];
++
++fn test_doh_source(qname: &str) -> EchSource {
++    let url = "https://127.0.0.1:1/dns-query".to_string();
++    let endpoint = DohEndpoint::parse(&url).unwrap();
++    EchSource::Doh(EchDohSource {
++        qname: qname.to_string(),
++        url,
++        endpoint,
++    })
++}
++
++fn test_discover_source(domain: &str) -> EchSource {
++    EchSource::Discover(domain.to_string())
++}
++
++#[test]
++fn parse_accepts_plus_and_space_separators() {
++    let EchSource::Doh(source) =
++        parse_ech_source("cloudflare-ech.com+https://223.5.5.5/dns-query").unwrap()
++    else {
++        panic!("expected Doh");
++    };
++    assert_eq!(source.qname, "cloudflare-ech.com");
++    assert_eq!(source.url, "https://223.5.5.5/dns-query");
++
++    // A literal `+` decodes to a space in query strings; both spellings
++    // must yield the same source.
++    let EchSource::Doh(spaced) =
++        parse_ech_source("cloudflare-ech.com https://223.5.5.5/dns-query").unwrap()
++    else {
++        panic!("expected Doh");
++    };
++    assert_eq!(spaced, source);
++}
++
++#[test]
++fn parse_bare_qname_uses_bootstrap_dns() {
++    let EchSource::Discover(qname) = parse_ech_source("cloudflare-ech.com").unwrap() else {
++        panic!("expected Discover");
++    };
++    assert_eq!(qname, "cloudflare-ech.com");
++}
++
++#[test]
++fn parse_normalizes_qname_and_keeps_url_parts() {
++    let EchSource::Doh(source) =
++        parse_ech_source("  Example.COM.+https://doh.example:8443/dns-query?dns=abc ").unwrap()
++    else {
++        panic!("expected Doh");
++    };
++    assert_eq!(source.qname, "example.com");
++    assert_eq!(source.url, "https://doh.example:8443/dns-query?dns=abc");
++}
++
++#[test]
++fn parse_rejects_malformed_sources() {
++    for raw in [
++        "",
++        "1",
++        "true",
++        "nodot",
++        "+https://223.5.5.5/dns-query",
++        " +https://223.5.5.5/dns-query",
++        "1.2.3.4+https://223.5.5.5/dns-query",
++        "cloudflare-ech.com+http://223.5.5.5/dns-query",
++        "cloudflare-ech.com+https://",
++        "cloudflare-ech.com+notaurl",
++        "cloudflare-ech.com+",
++        "bad!name.com+https://223.5.5.5/dns-query",
++        ".+https://223.5.5.5/dns-query",
++    ] {
++        assert!(parse_ech_source(raw).is_err(), "should reject {raw:?}");
++    }
++}
++
++#[test]
++fn endpoint_parse_and_authority() {
++    let endpoint = DohEndpoint::parse("https://223.5.5.5/dns-query").unwrap();
++    assert_eq!(endpoint.host, "223.5.5.5");
++    assert_eq!(endpoint.port, 443);
++    assert_eq!(endpoint.path, "/dns-query");
++    assert_eq!(endpoint.authority(), "223.5.5.5");
++
++    let endpoint = DohEndpoint::parse("https://example.com").unwrap();
++    assert_eq!(endpoint.path, "/dns-query");
++
++    let endpoint = DohEndpoint::parse("https://[::1]:8443/dns-query?dns=abc").unwrap();
++    assert_eq!(endpoint.host, "::1");
++    assert_eq!(endpoint.port, 8443);
++    assert_eq!(endpoint.path, "/dns-query?dns=abc");
++    assert_eq!(endpoint.authority(), "[::1]:8443");
++
++    let endpoint = DohEndpoint::parse("https://example.com:8443/").unwrap();
++    assert_eq!(endpoint.authority(), "example.com:8443");
++}
++
++#[test]
++fn dial_addr_always_carries_an_explicit_port() {
++    // `connect_marked` requires `host:port`; omitting 443 used to make every
++    // default-port fetch fail, and `[v6]` without a port split inside the
++    // address.
++    let endpoint = DohEndpoint::parse("https://223.5.5.5/dns-query").unwrap();
++    assert_eq!(endpoint.dial_addr(), "223.5.5.5:443");
++
++    let endpoint = DohEndpoint::parse("https://[2001:db8::1]/dns-query").unwrap();
++    assert_eq!(endpoint.dial_addr(), "[2001:db8::1]:443");
++
++    let endpoint = DohEndpoint::parse("https://example.com:8443/dns-query").unwrap();
++    assert_eq!(endpoint.dial_addr(), "example.com:8443");
++
++    let endpoint = DohEndpoint::parse("https://[::1]:8443/dns-query").unwrap();
++    assert_eq!(endpoint.dial_addr(), "[::1]:8443");
++}
++
++#[tokio::test]
++async fn dial_addr_connects_through_connect_outbound() {
++    // End-to-end through the real dial path: the formatted address must be
++    // accepted by `connect_outbound` (bypass-marked TCP).
++    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let port = listener.local_addr().unwrap().port();
++    let endpoint = DohEndpoint::parse(&format!("https://127.0.0.1:{port}/dns-query")).unwrap();
++    let dial_addr = endpoint.dial_addr();
++    let (accepted, connected) = tokio::join!(
++        listener.accept(),
++        crate::util::connect_outbound(&dial_addr, Duration::from_secs(5)),
++    );
++    accepted.unwrap();
++    connected.unwrap();
++}
++
++#[test]
++fn https_rr_query_wire_format() {
++    let query = crate::bootstrap::build_query("cloudflare-ech.com", crate::bootstrap::QTYPE_HTTPS);
++    // id(2) flags(2) qdcount(2) an/ns/ar(6) qname qtype(2) qclass(2)
++    assert_eq!(
++        &query[2..12],
++        &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
++    );
++    assert_eq!(
++        &query[12..],
++        b"\x0ecloudflare-ech\x03com\x00\x00\x41\x00\x01".as_slice()
++    );
++}
++
++#[test]
++fn doh_response_is_matched_to_the_query() {
++    let query = crate::bootstrap::build_query("cloudflare-ech.com", crate::bootstrap::QTYPE_HTTPS);
++    // The captured response has a fixed id; craft a query with that id.
++    let mut query = query;
++    query[0] = 0x12;
++    query[1] = 0x34;
++    assert!(crate::bootstrap::answers_query(&query, DOH_RESPONSE));
++    let mut wrong_id = DOH_RESPONSE.to_vec();
++    wrong_id[0] ^= 0xff;
++    assert!(!crate::bootstrap::answers_query(&query, &wrong_id));
++}
++
++#[tokio::test]
++async fn doh_post_round_trips_dns_response() {
++    let (client_io, server_io) = tokio::io::duplex(65536);
++    let server = tokio::spawn(async move {
++        let mut connection = h2::server::handshake(server_io).await.unwrap();
++        let (request, mut respond) = connection.accept().await.unwrap().unwrap();
++        assert_eq!(request.method(), http::Method::POST);
++        assert_eq!(
++            request.headers().get("content-type").unwrap(),
++            "application/dns-message"
++        );
++        let mut body = request.into_body();
++        let mut query = Vec::new();
++        while let Some(chunk) = body.data().await {
++            let chunk = chunk.unwrap();
++            query.extend_from_slice(&chunk);
++            let _ = body.flow_control().release_capacity(chunk.len());
++        }
++        assert_eq!(
++            &query[2..12],
++            &[0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
++        );
++        assert_eq!(
++            &query[12..],
++            b"\x0ecloudflare-ech\x03com\x00\x00\x41\x00\x01".as_slice()
++        );
++        // Echo the query's id in the response so the client's match check passes.
++        let mut response_body = DOH_RESPONSE.to_vec();
++        response_body[0] = query[0];
++        response_body[1] = query[1];
++        let response = http::Response::builder().status(200).body(()).unwrap();
++        let mut send = respond.send_response(response, false).unwrap();
++        send.send_data(Bytes::from(response_body), true).unwrap();
++        // Keep driving the connection so the queued DATA reaches the client.
++        while connection.accept().await.is_some() {}
++    });
++
++    let query = crate::bootstrap::build_query("cloudflare-ech.com", crate::bootstrap::QTYPE_HTTPS);
++    let body = doh_h2_post(client_io, "example.com", "/dns-query", &query)
++        .await
++        .unwrap();
++    let mut expected = DOH_RESPONSE.to_vec();
++    expected[0] = query[0];
++    expected[1] = query[1];
++    assert_eq!(body, expected);
++    let (ech, ttl) = crate::bootstrap::parse_https_rr_ech(&body).unwrap();
++    assert_eq!(ech, EXPECTED_ECH);
++    assert_eq!(ttl, 1);
++    server.abort();
++}
++
++#[test]
++fn cache_miss_returns_none() {
++    let source = test_discover_source("cache-miss.invalid");
++    assert!(cached_ech_config(&source).is_none());
++}
++
++#[test]
++fn published_config_is_visible_to_later_reads() {
++    // QUIC `start_session` and TLS `connect` read the cache per-connection;
++    // a published config (e.g. ECH_REJECTED retry configs) must be visible
++    // immediately.
++    let source = test_doh_source("publish.invalid");
++    publish_ech_config(&source, vec![2; 4]);
++    let cached = cached_ech_config(&source).unwrap();
++    assert_eq!(&*cached, &[2; 4]);
++    ECH_CACHE.lock().unwrap().remove(&source);
++}
++
++#[test]
++fn cache_entry_expires() {
++    let source = test_discover_source("cache-expire.invalid");
++    ECH_CACHE.lock().unwrap().insert(
++        source.clone(),
++        EchCacheEntry {
++            config: Some(vec![1; 4].into()),
++            expires: Instant::now() - Duration::from_secs(1),
++        },
++    );
++    assert!(cached_ech_config(&source).is_none());
++    ECH_CACHE.lock().unwrap().remove(&source);
++}
++
++#[test]
++fn negative_entry_caches_the_absence() {
++    let source = test_discover_source("cache-negative.invalid");
++    cache_put(&source, None, 60);
++    // A negative entry is a hit (Some(None)): `cached_ech_config` flattens
++    // it to `None`, but the entry exists so no refetch is triggered.
++    assert!(cache_get(&source).is_some());
++    assert!(cached_ech_config(&source).is_none());
++    ECH_CACHE.lock().unwrap().remove(&source);
++}
++
++#[test]
++fn discover_and_doh_sources_do_not_share_entries() {
++    let discover = test_discover_source("shared.invalid");
++    let doh = test_doh_source("shared.invalid");
++    assert_ne!(discover, doh);
++    publish_ech_config(&discover, vec![1; 4]);
++    assert!(cached_ech_config(&doh).is_none());
++    ECH_CACHE.lock().unwrap().remove(&discover);
++}
+diff --git a/crates/honk-outbound/src/lib.rs b/crates/honk-outbound/src/lib.rs
+index e23b0dff..a83dceec 100644
+--- a/crates/honk-outbound/src/lib.rs
++++ b/crates/honk-outbound/src/lib.rs
+@@ -10,6 +10,7 @@ mod address_race;
+ pub mod alive;
+ pub mod bootstrap;
+ pub mod descriptor;
++pub(crate) mod ech_doh;
+ pub mod group;
+ pub mod proxy;
+ pub mod quic;
+diff --git a/crates/honk-outbound/src/proxy/transport/xhttp/tests/download.rs b/crates/honk-outbound/src/proxy/transport/xhttp/tests/download.rs
+index 99de8af2..22328545 100644
+--- a/crates/honk-outbound/src/proxy/transport/xhttp/tests/download.rs
++++ b/crates/honk-outbound/src/proxy/transport/xhttp/tests/download.rs
+@@ -51,6 +51,8 @@ fn download_settings_give_the_node_runtime_a_download_pool() {
+             min: 100,
+             max: 1000,
+         },
++        ech_config: None,
++        ech_doh: None,
+     }));
+     assert_eq!(XhttpRuntime::new(&node).unwrap().pools().count(), 2);
+ }
+diff --git a/crates/honk-outbound/src/quic.rs b/crates/honk-outbound/src/quic.rs
+index 078479fe..bbe86e84 100644
+--- a/crates/honk-outbound/src/quic.rs
++++ b/crates/honk-outbound/src/quic.rs
+@@ -295,8 +295,9 @@ impl QuicClientOptions {
+ ///
+ /// TLS is the BoringSSL backend in [`crate::quic::boring`] (Chrome fingerprint
+ /// when `tls_implementation = "utls"`, ECH when the node carries one —
+-/// static config, or DNS HTTPS-RR discovery when only `ech_enabled` is set,
+-/// pinSHA256 when `tls_pin_sha256` is set).
++/// static config, an `ech=<qname>[+<doh-url>]` dynamic source, or DNS
++/// HTTPS-RR discovery when only `ech_enabled` is set, pinSHA256 when
++/// `tls_pin_sha256` is set).
+ pub async fn client_config(
+     node: &honk_config::node::Node,
+     alpn: &[&[u8]],
+@@ -319,14 +320,23 @@ pub async fn client_config(
+         .iter()
+         .flat_map(|p| std::iter::once(p.len() as u8).chain(p.iter().copied()))
+         .collect::<Vec<u8>>();
+-    let ech = match crate::tls::load_ech_config_list(node)? {
+-        Some(list) => Some(Arc::new(list)),
+-        None if tls.ech_enabled => {
+-            let name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
+-            crate::tls::discover_ech_config(&name).await.map(Arc::new)
++    // Resolve ECH once. `DiscoverSni` is pinned to the configured SNI (or
++    // host) here; `start_session` then resolves per-connection from the TTL
++    // cache, so key rotation reaches long-lived runtimes.
++    let ech = match crate::ech_doh::Ech::resolve(node)? {
++        Some(crate::ech_doh::Ech::DiscoverSni) => {
++            let domain = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
++            Some(crate::ech_doh::Ech::Source(
++                crate::ech_doh::EchSource::discover(&domain),
++            ))
+         }
+-        None => None,
++        other => other,
+     };
++    // Warm the cache: the first connection waits for the fetch (bounded)
++    // instead of leaking the SNI.
++    if let Some(crate::ech_doh::Ech::Source(source)) = &ech {
++        crate::ech_doh::ech_config(source).await;
++    }
+     let pin_sha256 = tls
+         .pin_sha256
+         .as_deref()
+@@ -344,7 +354,7 @@ pub async fn client_config(
+             alpn_wire,
+             skip_cert_verify: tls.skip_cert_verify,
+             chrome: crate::tls::chrome_mode(),
+-            ech_config_list: ech,
++            ech,
+             pin_sha256,
+             ticket_key: Some(format!(
+                 "{}|{}|{}|{}",
+diff --git a/crates/honk-outbound/src/quic/boring.rs b/crates/honk-outbound/src/quic/boring.rs
+index f35ba5ca..6d958ca1 100644
+--- a/crates/honk-outbound/src/quic/boring.rs
++++ b/crates/honk-outbound/src/quic/boring.rs
+@@ -536,8 +536,8 @@ pub struct BoringQuicOptions {
+     pub skip_cert_verify: bool,
+     /// Chrome ClientHello fingerprint.
+     pub chrome: bool,
+-    /// Static ECHConfigList; ECH GREASE applies when `chrome` and unset.
+-    pub ech_config_list: Option<Arc<Vec<u8>>>,
++    /// ECH origin, resolved once at build time (`None` means no ECH).
++    pub(crate) ech: Option<crate::ech_doh::Ech>,
+     /// pinSHA256 leaf-certificate fingerprint; replaces PKI and hostname
+     /// verification when set.
+     pub pin_sha256: Option<[u8; 32]>,
+@@ -552,7 +552,7 @@ pub struct BoringQuicClientConfig {
+     ctx: SslContext,
+     alpn_wire: Vec<u8>,
+     chrome: bool,
+-    ech_config_list: Option<Arc<Vec<u8>>>,
++    ech: Option<crate::ech_doh::Ech>,
+     /// pinSHA256 is in use: resumption disabled (PSK would bypass the pin).
+     has_pin: bool,
+     /// Session-ticket cache key (defaults to the server name when unset).
+@@ -566,7 +566,7 @@ impl BoringQuicClientConfig {
+             alpn_wire,
+             skip_cert_verify,
+             chrome,
+-            ech_config_list,
++            ech,
+             pin_sha256,
+             ticket_key,
+         } = options;
+@@ -606,7 +606,7 @@ impl BoringQuicClientConfig {
+             ctx: builder.build(),
+             alpn_wire,
+             chrome,
+-            ech_config_list,
++            ech,
+             has_pin: pin_sha256.is_some(),
+             ticket_key,
+         })
+@@ -671,9 +671,28 @@ impl crypto::ClientConfig for BoringQuicClientConfig {
+             ssl.set_permute_extensions(true);
+             crate::tls::set_chrome_key_shares_ssl_ref(&ssl).expect("SSL_set1_client_key_shares");
+         }
+-        match &self.ech_config_list {
++        // ECH is resolved per-connection from the TTL cache so key rotation
++        // reaches later connections on a long-lived runtime. On a miss, a
++        // background refill is triggered; this connection proceeds without
++        // ECH (GREASE in Chrome mode) rather than blocking the handshake.
++        let ech = match &self.ech {
++            Some(crate::ech_doh::Ech::Static(list)) => Some(list.clone()),
++            Some(crate::ech_doh::Ech::Source(source)) => {
++                match crate::ech_doh::cached_ech_config(source) {
++                    Some(config) => Some(config),
++                    None => {
++                        crate::ech_doh::spawn_ech_refresh(source.clone());
++                        None
++                    }
++                }
++            }
++            // QUIC pins `DiscoverSni` to a concrete domain at build time.
++            Some(crate::ech_doh::Ech::DiscoverSni) => None,
++            None => None,
++        };
++        match ech {
+             Some(list) => ssl
+-                .set_ech_config_list(list)
++                .set_ech_config_list(&list)
+                 .expect("invalid ECHConfigList"),
+             None if self.chrome => ssl.set_enable_ech_grease(true),
+             None => {}
+diff --git a/crates/honk-outbound/src/tls.rs b/crates/honk-outbound/src/tls.rs
+index 82bc4f99..2a658d09 100644
+--- a/crates/honk-outbound/src/tls.rs
++++ b/crates/honk-outbound/src/tls.rs
+@@ -4,10 +4,12 @@
+ //! ALPS and certificate compression; it does not promise exact browser identity.
+ //!
+ //! ECH: when a node carries an ECHConfigList (`ech_config` / `ech_config_path`)
+-//! the connector offers real ECH via `SSL_set1_ech_config_list`; `ech_enabled`
+-//! without a static config triggers DNS HTTPS-RR discovery (RFC 9460) at
+-//! connect time; without either, Chrome mode sends ECH GREASE like a real
+-//! browser.
++//! the connector offers real ECH via `SSL_set1_ech_config_list`;
++//! `ech=<qname>+<doh-url>` fetches the list for `qname`'s HTTPS record from
++//! the given DoH endpoint ([`crate::ech_doh`]); a bare `ech=<qname>` and
++//! `ech_enabled` without either trigger DNS HTTPS-RR discovery (RFC 9460)
++//! at connect time; without any of these, Chrome mode sends ECH GREASE like
++//! a real browser.
+ //!
+ //! Controlled by global config: tls_implementation ("tls"|"utls"), utls_imitate
+ //! (only the Chrome profile exists; other values warn and fall back).
+@@ -182,17 +184,15 @@ pub struct TlsConnector {
+     connector: SslConnector,
+     chrome: bool,
+     alps: bool,
+-    ech_config_list: Option<Arc<Vec<u8>>>,
+-    /// `ech_enabled` without a static config: discover via DNS HTTPS RR at
+-    /// connect time (best-effort, fail-open).
+-    ech_discovery: bool,
++    /// ECH origin, resolved once at build time. `None` means no ECH.
++    ech: Option<crate::ech_doh::Ech>,
+ }
+ 
+ impl TlsConnector {
+     /// Per-connection `Ssl` configuration: applies the parts of the Chrome
+     /// profile that only exist per-SSL (permuted extensions, key shares,
+     /// ALPS, ECH) — BoringSSL has no ctx-level API for these.
+-    fn configuration(&self, ech: Option<Arc<Vec<u8>>>) -> anyhow::Result<ConnectConfiguration> {
++    fn configuration(&self, ech: Option<Arc<[u8]>>) -> anyhow::Result<ConnectConfiguration> {
+         let mut cfg = self.connector.configure()?;
+         if self.chrome {
+             cfg.set_permute_extensions(true);
+@@ -216,10 +216,17 @@ impl TlsConnector {
+     where
+         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+     {
+-        let ech = match &self.ech_config_list {
+-            Some(list) => Some(list.clone()),
+-            None if self.ech_discovery => discover_ech_config(domain).await.map(Arc::new),
+-            None => None,
++        let (ech, source) = match &self.ech {
++            Some(crate::ech_doh::Ech::Static(list)) => (Some(list.clone()), None),
++            Some(crate::ech_doh::Ech::Source(source)) => (
++                crate::ech_doh::ech_config(source).await,
++                Some(source.clone()),
++            ),
++            Some(crate::ech_doh::Ech::DiscoverSni) => {
++                let source = crate::ech_doh::EchSource::discover(domain);
++                (crate::ech_doh::ech_config(&source).await, Some(source))
++            }
++            None => (None, None),
+         };
+         let cfg = self.configuration(ech.clone())?;
+         match tokio_boring::connect(cfg, domain, stream).await {
+@@ -240,12 +247,14 @@ impl TlsConnector {
+                 let rejected = e.to_string().contains("ECH_REJECTED");
+                 if rejected
+                     && let Some(ssl) = e.ssl()
+-                    && ssl.get_ech_retry_configs().is_some()
++                    && let Some(retry) = ssl.get_ech_retry_configs()
++                    && let Some(source) = source
+                 {
+-                    tracing::debug!(
++                    tracing::info!(
+                         sni = domain,
+-                        "ECH rejected; server offered retry ECH configs (not persisted)"
++                        "ECH rejected; publishing server retry configs for next dial"
+                     );
++                    crate::ech_doh::publish_ech_config(&source, retry.to_vec());
+                 }
+                 Err(anyhow::anyhow!("TLS handshake with {domain} failed: {e}"))
+             }
+@@ -327,9 +336,10 @@ fn decode_ech_config_list(encoded: &str) -> anyhow::Result<Vec<u8>> {
+     anyhow::bail!("invalid base64 ECHConfigList")
+ }
+ 
+-/// Resolve the node's ECHConfigList, if any. Explicit `ech_config` wins over
+-/// `ech_config_path`. `ech_enabled` without configs is handled separately at
+-/// connect time via DNS HTTPS-RR discovery ([`discover_ech_config`]).
++/// Resolve the node's static ECHConfigList, if any. Explicit `ech_config`
++/// wins over `ech_config_path`. Dynamic sources (`ech_enabled`,
++/// `ech=<qname>[+<doh-url>]`) are resolved separately via
++/// [`crate::ech_doh::Ech`].
+ pub fn load_ech_config_list(node: &Node) -> anyhow::Result<Option<Vec<u8>>> {
+     load_ech_config_list_with_reader(node, |path| read_dependency(node, path))
+ }
+@@ -377,6 +387,7 @@ pub fn validate_connector_config_with_ech_reader(
+         node.validate_protocol()?;
+     }
+     load_ech_config_list_with_reader(node, read)?;
++    crate::ech_doh::parse_node_ech_source(node)?;
+     if let Some(pin) = node.tls().and_then(|tls| tls.pin_sha256.as_deref())
+         && parse_pin_sha256(pin).is_none()
+     {
+@@ -421,50 +432,16 @@ pub fn chrome_mode() -> bool {
+     USE_CHROME_TLS.load(Ordering::Acquire)
+ }
+ 
+-/// Process-wide cache for DNS-discovered ECHConfigLists (RFC 9460 HTTPS RR).
+-struct EchCacheEntry {
+-    config: Option<Vec<u8>>,
+-    expires: std::time::Instant,
+-}
+-
+-static ECH_DISCOVERY_CACHE: LazyLock<
+-    std::sync::Mutex<std::collections::HashMap<String, EchCacheEntry>>,
+-> = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+-
+-/// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460),
+-/// cached per domain (positive: record TTL clamped to 60s..1d; negative:
+-/// 5 min). Best-effort and fail-open: any failure yields `None`, unlike
+-/// explicit `ech_config` which is fail-closed.
++/// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460).
++/// Thin wrapper over the unified ECH cache for external tools.
+ pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
+     let key = domain.trim_end_matches('.').to_ascii_lowercase();
+     if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
+         return None;
+     }
+-    if let Some(hit) = ECH_DISCOVERY_CACHE.lock().unwrap().get(&key)
+-        && hit.expires > std::time::Instant::now()
+-    {
+-        return hit.config.clone();
+-    }
+-    let (config, ttl) = match tokio::time::timeout(
+-        std::time::Duration::from_secs(3),
+-        crate::bootstrap::query_ech_config(&key),
+-    )
+-    .await
+-    {
+-        Ok(Ok(Some((ech, ttl)))) => (Some(ech), ttl.clamp(60, 86400)),
+-        _ => (None, 300),
+-    };
+-    if config.is_some() {
+-        tracing::debug!(domain = %key, "discovered ECH config via DNS HTTPS RR");
+-    }
+-    ECH_DISCOVERY_CACHE.lock().unwrap().insert(
+-        key,
+-        EchCacheEntry {
+-            config: config.clone(),
+-            expires: std::time::Instant::now() + std::time::Duration::from_secs(ttl as u64),
+-        },
+-    );
+-    config
++    crate::ech_doh::ech_config(&crate::ech_doh::EchSource::Discover(key))
++        .await
++        .map(|arc| arc.to_vec())
+ }
+ 
+ /// Build the shared BoringSSL trust and protocol defaults.
+@@ -577,7 +554,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
+         )
+     })?;
+     let chrome = chrome_mode();
+-    let ech_config_list = load_ech_config_list(node)?;
++    let ech = crate::ech_doh::Ech::resolve(node)?;
+ 
+     let pin = match tls.pin_sha256.as_deref() {
+         Some(s) => Some(parse_pin_sha256(s).ok_or_else(|| {
+@@ -649,8 +626,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
+         connector,
+         chrome,
+         alps,
+-        ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
+-        ech_config_list: ech_config_list.map(Arc::new),
++        ech,
+     })
+ }
+ 
+@@ -670,8 +646,7 @@ pub fn build_dns_connector(
+         connector: builder.build(),
+         chrome,
+         alps: chrome && alpn_wire.windows(3).any(|proto| proto == b"\x02h2"),
+-        ech_config_list: None,
+-        ech_discovery: false,
++        ech: None,
+     })
+ }
+ 
+diff --git a/doc/en/reference/nodes.md b/doc/en/reference/nodes.md
+index 4875f741..0acac088 100644
+--- a/doc/en/reference/nodes.md
++++ b/doc/en/reference/nodes.md
+@@ -74,6 +74,7 @@ The Node model exposes the fields below. Share links populate operator-facing fi
+ | `ech_enabled` | bool | `false` | Static ECH config present, or `ech=1`/`true` |
+ | `ech_config` | string? | null | Base64 ECHConfigList from `ech_config` or `echconfig` |
+ | `ech_config_path` | string? | null | Structured-loader path to a base64 ECHConfigList; not a share-link query |
++| `ech_doh` | string? | null | Dynamic ECH source from `ech=<qname>[+<doh-url>]` |
+ | `reality_public_key` | string? | null | REALITY X25519 public key from `pbk` |
+ | `reality_short_id` | string? | null | REALITY short ID from `sid` |
+ | `reality_spider_x` | string? | null | Stored `spx`; a REALITY link defaults it to `/` |
+@@ -228,7 +229,7 @@ Without a configured `User-Agent`, every XHTTP request also carries Xray's defau
+ 
+ Top-level `host`, `path` and `mode` remain authoritative when extra is present. URI `fp` is accepted but ignored because global TLS mode owns the fingerprint; `headerType` and `quicSecurity` set to `none` or empty, and an empty `serviceName`, are accepted and ignored because XHTTP owns its HTTP framing. A `headers` query parameter is accepted and dropped only as a JSON object whose sole member is `Referer`: Xray's padding overwrites that header, so it never reaches the wire. Certificate-verification aliases (`allowInsecure`, `allow_insecure`, `insecure`) retain their shared TLS meaning and must agree. Extra `noSSEHeader`, `scMaxBufferedPosts` and `scStreamUpServerSecs` configure only Xray servers; they are type-checked and dropped. `xmux` is accepted only when all-zero or exactly Xray's fill-in for an omitted XMUX (`maxConcurrency` 1, `hMaxRequestTimes` 600-900, `hMaxReusableSecs` 1800-3000, everything else 0); it is then dropped, and other values reject. Unknown or unsupported options, including alternate session/sequence/payload placement, custom upload methods and padding-obfuscation profiles, reject the entire node even when supplied as null or empty. Mihomo subscriptions use the corresponding `xhttp-opts` fields; official sing-box and client-record XHTTP transports remain unsupported.
+ 
+-Extra `downloadSettings` (an Xray StreamConfig) sends the GET to a separate endpoint with Xray's meaning: nothing is inherited from the upload side, including configured headers, so download GETs carry the default Chrome `fetch()` set even when the upload side configures a `User-Agent`. It requires `address`, `port`, `network: xhttp` and `security: tls`; the address is trimmed and lowercased and must be a hostname or IPv4 literal, because the dialer joins it with the port textually. `tlsSettings.serverName`, `xhttpSettings.path` and `xhttpSettings.host` map to the flat `xhttp.download` object (`address`, `port`, `server_name`, `host`, `path`, and `x_padding_bytes` defaulting to `100-1000`). Top-level and `tlsSettings` ALPN may only be absent or `h2`; `tlsSettings.fingerprint` and `xhttpSettings.mode` are checked and ignored, and known members set to null count as absent. The download peer always verifies TLS: upload pins, insecure verification, ECH and REALITY never apply to it, and `allowInsecure: true`, REALITY, `sockopt`, download `headers` or `extra` and any other member reject. Its HTTP host falls back to its own server name and then its address. Download settings reject with `stream-one` mode or a REALITY upload. Each peer keeps its own carrier pool, so a Trojan or VMess node may hold four reusable carriers outside the VLESS process permit; delay probes and `honk-tool sub` address-family columns describe only the upload endpoint.
++Extra `downloadSettings` (an Xray StreamConfig) sends the GET to a separate endpoint with Xray's meaning: nothing is inherited from the upload side, including configured headers, so download GETs carry the default Chrome `fetch()` set even when the upload side configures a `User-Agent`. It requires `address`, `port`, `network: xhttp` and `security: tls`; the address is trimmed and lowercased and must be a hostname or IPv4 literal, because the dialer joins it with the port textually. `tlsSettings.serverName`, `xhttpSettings.path` and `xhttpSettings.host` map to the flat `xhttp.download` object (`address`, `port`, `server_name`, `host`, `path`, and `x_padding_bytes` defaulting to `100-1000`). Top-level and `tlsSettings` ALPN may only be absent or `h2`; `tlsSettings.fingerprint` and `xhttpSettings.mode` are checked and ignored, and known members set to null count as absent. The download peer always verifies TLS: upload pins, insecure verification and REALITY never apply to it, and `allowInsecure: true`, REALITY, `sockopt`, download `headers` or `extra` and any other member reject. ECH applies only from the download's own `tlsSettings.echConfigList`, never inherited from the upload side: a base64 value is a static ECHConfigList (the flat `ech_config`), and a `<qname>[+<doh-url>]` value is a dynamic source (the flat `ech_doh`) resolved like a node's own `ech=` source; any other value rejects. Its HTTP host falls back to its own server name and then its address. Download settings reject with `stream-one` mode or a REALITY upload. Each peer keeps its own carrier pool, so a Trojan or VMess node may hold four reusable carriers outside the VLESS process permit; delay probes and `honk-tool sub` address-family columns describe only the upload endpoint.
+ 
+ XHTTP does not permit TCP Mux.Cool; UDP-only XUDP carriers remain supported. Existing VLESS UDP permission, packet encoding and UDP/443 policy are unchanged. Packet-up has no wire upload-EOF marker: shutdown flushes accepted upload bytes and retains the GET for the application's final reply; closing the logical flow retires its requests.
+ 
+@@ -414,6 +415,7 @@ Per-node ECH controls are:
+ | --- | --- |
+ | `ech_config=<base64>` / `echconfig=<base64>` | Static ECHConfigList; implies `ech_enabled` and takes precedence |
+ | `ech_config_path` | Structured-loader file path; `ech_config` wins when both exist |
++| `ech=<qname>[+<doh-url>]` | Fetch the ECHConfigList from `qname`'s HTTPS record: with `+<doh-url>` via that DoH endpoint (bypass-marked, refreshed on the record TTL); a bare `qname` resolves through the bootstrap DNS path like `ech=1`; implies `ech_enabled` |
+ | `ech=1` / `ech=true` | Enable DNS HTTPS-RR discovery when no static config exists |
+ 
+ A static config offers real ECH and ECH rejection fails the handshake closed. Discovery is best-effort and fail-open: if no ECHConfigList is found, the handshake continues without real ECH; `utls` still emits ECH GREASE. Discovery uses the bootstrap resolver or the first system nameserver and caches results by domain. The same controls apply to QUIC protocols.
+diff --git a/doc/zh/reference/nodes.md b/doc/zh/reference/nodes.md
+index 36a86171..b0edb3c2 100644
+--- a/doc/zh/reference/nodes.md
++++ b/doc/zh/reference/nodes.md
+@@ -74,6 +74,7 @@ Node 模型包含下列字段。分享链接从 scheme、userinfo、authority、
+ | `ech_enabled` | bool | `false` | 存在静态 ECH 配置，或 `ech=1`/`true` |
+ | `ech_config` | string? | null | 来自 `ech_config` 或 `echconfig` 的 Base64 ECHConfigList |
+ | `ech_config_path` | string? | null | 结构化 loader 中指向 base64 ECHConfigList 的路径；不是分享链接 query |
++| `ech_doh` | string? | null | 来自 `ech=<qname>[+<doh-url>]` 的动态 ECH 源 |
+ | `reality_public_key` | string? | null | 来自 `pbk` 的 REALITY X25519 公钥 |
+ | `reality_short_id` | string? | null | 来自 `sid` 的 REALITY short ID |
+ | `reality_spider_x` | string? | null | 存储的 `spx`；REALITY 链接默认设为 `/` |
+@@ -227,7 +228,7 @@ URI `extra` 接受百分号编码的 JSON 对象，可含 `host`、`path`、`mod
+ 
+ 存在 extra 时，顶层 `host`、`path`、`mode` 保持权威。URI `fp` 接受但忽略，指纹由全局 TLS 模式控制；`headerType` 与 `quicSecurity` 为 `none` 或空值、`serviceName` 为空值时接受但忽略，因为 XHTTP 自行管理 HTTP framing。查询参数 `headers` 只有在是唯一成员为 `Referer` 的 JSON 对象时才接受并丢弃：Xray 的 padding 会覆盖该 header，它不会出现在线路上。证书校验别名（`allowInsecure`、`allow_insecure`、`insecure`）保留共用 TLS 语义，且必须一致。Extra 中的 `noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs` 只作用于 Xray 服务端；检查类型后丢弃。`xmux` 只在全为零，或恰好等于 Xray 对缺省 XMUX 的填充值（`maxConcurrency` 1、`hMaxRequestTimes` 600-900、`hMaxReusableSecs` 1800-3000、其余为 0）时接受并丢弃；其他取值拒绝。未知或未实现的参数，包括其他 session/sequence/payload placement、自定义上传方法、padding 混淆 profile，即使为 null 或空值也会拒绝整个节点。Mihomo 订阅使用对应 `xhttp-opts`；官方 sing-box 与 client-record 的 XHTTP transport 仍不支持。
+ 
+-Extra 中的 `downloadSettings`（Xray StreamConfig）把 GET 发往独立端点，语义与 Xray 相同：不从上传端继承任何内容，包括已配置的请求头；因此即使上传端配置了 `User-Agent`，下载 GET 仍携带默认的 Chrome `fetch()` 请求头。它要求 `address`、`port`、`network: xhttp` 与 `security: tls`；地址会去掉首尾空白并转为小写，且必须是主机名或 IPv4 字面量，因为拨号时按文本与端口拼接。`tlsSettings.serverName`、`xhttpSettings.path`、`xhttpSettings.host` 映射到 flat `xhttp.download` 对象（`address`、`port`、`server_name`、`host`、`path`，以及默认 `100-1000` 的 `x_padding_bytes`）。顶层与 `tlsSettings` 的 ALPN 只能缺省或为 `h2`；`tlsSettings.fingerprint` 与 `xhttpSettings.mode` 检查后忽略；值为 null 的已知成员视为缺省。下载端始终校验 TLS：上传端的 pin、不安全校验、ECH 与 REALITY 都不作用于它；`allowInsecure: true`、REALITY、`sockopt`、下载端 `headers` 或 `extra` 以及其他任何成员都会拒绝。其 HTTP host 依次回退到自身 server name、地址。下载设置与 `stream-one` 模式或 REALITY 上传端同时出现时拒绝。每个 peer 各有一个 carrier pool，因此 Trojan 或 VMess 节点最多可持有四条不占 VLESS 进程 permit 的可复用 carrier；延迟探测与 `honk-tool sub` 的地址族列只反映上传端点。
++Extra 中的 `downloadSettings`（Xray StreamConfig）把 GET 发往独立端点，语义与 Xray 相同：不从上传端继承任何内容，包括已配置的请求头；因此即使上传端配置了 `User-Agent`，下载 GET 仍携带默认的 Chrome `fetch()` 请求头。它要求 `address`、`port`、`network: xhttp` 与 `security: tls`；地址会去掉首尾空白并转为小写，且必须是主机名或 IPv4 字面量，因为拨号时按文本与端口拼接。`tlsSettings.serverName`、`xhttpSettings.path`、`xhttpSettings.host` 映射到 flat `xhttp.download` 对象（`address`、`port`、`server_name`、`host`、`path`，以及默认 `100-1000` 的 `x_padding_bytes`）。顶层与 `tlsSettings` 的 ALPN 只能缺省或为 `h2`；`tlsSettings.fingerprint` 与 `xhttpSettings.mode` 检查后忽略；值为 null 的已知成员视为缺省。下载端始终校验 TLS：上传端的 pin、不安全校验与 REALITY 都不作用于它；`allowInsecure: true`、REALITY、`sockopt`、下载端 `headers` 或 `extra` 以及其他任何成员都会拒绝。ECH 只来自下载端自己的 `tlsSettings.echConfigList`，从不继承上传端：base64 值是静态 ECHConfigList（flat 的 `ech_config`）；`<qname>[+<doh-url>]` 值是动态源（flat 的 `ech_doh`），按节点自身 `ech=` 源的方式解析；其他值拒绝。其 HTTP host 依次回退到自身 server name、地址。下载设置与 `stream-one` 模式或 REALITY 上传端同时出现时拒绝。每个 peer 各有一个 carrier pool，因此 Trojan 或 VMess 节点最多可持有四条不占 VLESS 进程 permit 的可复用 carrier；延迟探测与 `honk-tool sub` 的地址族列只反映上传端点。
+ 
+ XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP carrier。已有 VLESS UDP 权限、packet encoding 与 UDP/443 策略不变。Packet-up 没有上传 EOF 的 wire 标记：shutdown 刷新已经接受的上传字节并保留 GET 等待应用最终回复；关闭逻辑流才结束其请求。
+ 
+@@ -413,6 +414,7 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。target TLS record 的缓冲
+ | --- | --- |
+ | `ech_config=<base64>` / `echconfig=<base64>` | 静态 ECHConfigList；隐含 `ech_enabled` 且优先 |
+ | `ech_config_path` | 结构化 loader 文件路径；两者同时存在时 `ech_config` 优先 |
++| `ech=<qname>[+<doh-url>]` | 获取 `qname` 的 HTTPS 记录中的 ECHConfigList：带 `+<doh-url>` 时通过该 DoH 端点获取（bypass 标记，按记录 TTL 刷新）；只写 `qname` 时走 bootstrap DNS 路径（同 `ech=1`）；隐含 `ech_enabled` |
+ | `ech=1` / `ech=true` | 没有静态配置时开启 DNS HTTPS-RR 发现 |
+ 
+ 静态配置会提供真实 ECH，ECH 被拒绝时握手 fail-closed。发现是尽力而为且 fail-open：找不到 ECHConfigList 时，握手不带真实 ECH 继续；`utls` 仍发送 ECH GREASE。发现使用 bootstrap resolver，未配置时使用系统首个 nameserver，并按域名缓存结果。同一组控制项也适用于 QUIC 协议。

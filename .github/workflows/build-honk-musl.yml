@@ -1,0 +1,172 @@
+name: Build honk-core musl
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: build-honk-musl-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  HONK_REPOSITORY: Glassyiris/honk
+  HONK_COMMIT: 8b6778cefa12611492187ac2560f014452f0a64a
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-unknown-linux-musl
+          - target: x86_64-unknown-linux-musl
+
+    steps:
+      # This repository is expected to contain 0001-ech-doh-source.patch at its root.
+      - name: Checkout patch source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: patch-source
+
+      - name: Checkout honk source at pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.HONK_REPOSITORY }}
+          ref: ${{ env.HONK_COMMIT }}
+          path: honk
+          fetch-depth: 0
+
+      - name: Verify and apply ECH/DoH source patch
+        working-directory: honk
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/patch-source/0001-ech-doh-source.patch"
+          test -f "$patch" || { echo "Missing patch file: $patch" >&2; exit 1; }
+          git apply --check "$patch"
+          git apply "$patch"
+
+      - name: Read Rust toolchains
+        id: toolchain
+        working-directory: honk
+        run: |
+          set -euo pipefail
+          echo "stable=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "ebpf=$(grep -oP '^channel\s*=\s*"\K[^"]+' crates/honk-ebpf/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust stable and target
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+          target: ${{ matrix.target }}
+
+      - name: Install Rust nightly for eBPF
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.ebpf }}
+          components: rust-src, llvm-tools
+
+      - name: Install system dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev pkg-config cmake libclang-dev zstd
+
+      - name: Install pinned bpf-linker
+        working-directory: honk
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            "https://github.com/aya-rs/bpf-linker/releases/download/v$BPF_LINKER_VERSION/bpf-linker-x86_64-unknown-linux-musl.tar.zst"
+          echo "$BPF_LINKER_SHA256  $RUNNER_TEMP/bpf-linker.tar.zst" | sha256sum -c -
+          zstd -dc "$RUNNER_TEMP/bpf-linker.tar.zst" | tar -xf - -C "$CARGO_HOME/bin"
+          bpf-linker --version
+
+      - name: Build eBPF object
+        working-directory: honk/crates/honk-ebpf
+        run: cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+
+      - name: Verify eBPF object has BTF
+        working-directory: honk
+        run: readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
+
+      - name: Install zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
+
+      - name: Fetch doona UI source
+        working-directory: honk
+        run: |
+          set -euo pipefail
+          dir=$(ci/fetch-doona.sh)
+          echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
+
+      - name: Configure honk-core features
+        run: echo "FEATURES=clash-api,ebpf,rprx,native-ui,mimalloc" >> "$GITHUB_ENV"
+
+      - name: Build honk-core musl target
+        working-directory: honk
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${{ matrix.target }}"
+          export ZIGCC_TARGET="${T/-unknown/}"
+          L=$(printf '%s' "$T" | tr '-' '_')
+          U=$(printf '%s' "$T" | tr 'a-z-' 'A-Z_')
+          eval "export CC_${L}=\$PWD/ci/zigcc"
+          eval "export CXX_${L}=\$PWD/ci/zigcxx"
+          eval "export CARGO_TARGET_${U}_LINKER=\$PWD/ci/zigcc"
+          # Use Zig's CRT for musl to avoid duplicate _start definitions.
+          eval "export CARGO_TARGET_${U}_RUSTFLAGS='-C link-self-contained=no'"
+          export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
+          cargo build --release -p honk-core --no-default-features --features "$FEATURES" --target "$T"
+
+      - name: Package artifact
+        working-directory: honk
+        run: |
+          set -euo pipefail
+          name="honk-core-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
+          cp LICENSE README.md "dist/$name/"
+          mkdir -p "dist/$name/doona"
+          cp -r "$HONK_DOONA_DIR"/{LICENSE,LICENSES,NOTICE,THIRD-PARTY-NOTICES.txt} "dist/$name/doona/"
+          tar -czf "$GITHUB_WORKSPACE/$name.tar.gz" -C dist "$name"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: honk-core-${{ matrix.target }}
+          path: honk-core-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v$(date -u +%Y%m%dT%H%M%SZ)-${{ matrix.target }}
+          name: $(date -u +%Y%m%dT%H%M%SZ)-${{ matrix.target }}
+          files: |
+            ${{ github.workspace }}/honk-core-${{ matrix.target }}.tar.gz
+
+      - name: Delete Old Releases
+        uses: dev-drprasad/delete-older-releases@master
+        env:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        with:
+          keep_latest: 5
+          delete_tags: true
+
+      - name: Delete Old Workflows
+        uses: Mattraks/delete-workflow-runs@main
+        with:
+          retain_days: 7
+          keep_minimum_runs: 7
